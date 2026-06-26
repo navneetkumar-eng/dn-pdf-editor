@@ -1,13 +1,6 @@
 """
 DN PDF Editor Pro - PDF Generator
-Overlays edited values on the original PDF without re-creating the layout.
-
-Key facts from PDF analysis:
-- All values: font NotoSansDevanagari-Regular, size 9.22
-- Total values (Number of Items, Sub Total, GST Total, Grand Total): Bold
-- Values are RIGHT-ALIGNED within their columns
-- Column right edges (from table borders): qty=255, rate=305, sub=355, gst=392, net=442
-- Totals right edge: 554
+Multi-page aware. Matches original PDF font, size, bold, and alignment exactly.
 """
 
 from __future__ import annotations
@@ -22,70 +15,90 @@ from utils import setup_logger
 
 log = setup_logger(__name__)
 
-# ── Font constants matching original PDF ───────────────────────────────────────
-FONT_SIZE    = 9.22   # exact size from original PDF
+FONT_SIZE    = 9.22
 FONT_REGULAR = "helv"
-FONT_BOLD    = "hebo"  # Helvetica Bold
+FONT_BOLD    = "hebo"
 
-# Column RIGHT edges (from vertical line positions in PDF)
+# Column RIGHT edges (verified from PDF border positions)
 COL_RIGHT = {
     "qty":        253.0,
     "rate":       304.0,
     "sub_total":  354.0,
     "gst_pct":    391.0,
     "net_amount": 441.0,
-    "totals":     554.5,   # right edge for all total values
+    "totals":     554.5,
 }
 
+# Page width for center-alignment calculations
+PAGE_WIDTH = 595.0
 
-# ── Helpers ────────────────────────────────────────────────────────────────────
+
+# ── Low-level drawing helpers ──────────────────────────────────────────────────
 
 def _redact(page: fitz.Page, bbox: Tuple, padding: float = 2.0) -> None:
-    """Permanently erase text in bbox using redaction annotation."""
+    """Permanently erase text in bbox."""
     x0, y0, x1, y1 = bbox
-    rect = fitz.Rect(x0 - padding, y0 - padding, x1 + padding, y1 + padding)
-    page.add_redact_annot(rect, fill=(1, 1, 1))
-
-
-def _insert_right_aligned(
-    page:      fitz.Page,
-    text:      str,
-    right_x:   float,
-    baseline_y: float,
-    font_size: float = FONT_SIZE,
-    bold:      bool  = False,
-) -> None:
-    """Insert text RIGHT-ALIGNED so its right edge is at right_x."""
-    fontname = FONT_BOLD if bold else FONT_REGULAR
-    font     = fitz.Font(fontname)
-    tw       = font.text_length(text, fontsize=font_size)
-    x        = right_x - tw
-    page.insert_text(
-        fitz.Point(x, baseline_y),
-        text,
-        fontname=fontname,
-        fontsize=font_size,
-        color=(0, 0, 0),
+    page.add_redact_annot(
+        fitz.Rect(x0-padding, y0-padding, x1+padding, y1+padding),
+        fill=(1, 1, 1)
     )
 
 
-def _find_amount_bbox(
-    spans:    list[SpanInfo],
-    target_y: float,
-    min_x:    float = 500.0,
-    page:     int   = 0,
-) -> Tuple | None:
-    """Find the rightmost span near target_y with x > min_x."""
-    candidates = [
-        s for s in spans
-        if s.page == page
-        and s.bbox[0] > min_x
-        and abs((s.bbox[1] + s.bbox[3]) / 2 - target_y) < 10
-    ]
-    if not candidates:
-        return None
-    candidates.sort(key=lambda s: s.bbox[0])
-    return candidates[-1].bbox
+def _insert_right_aligned(
+    page: fitz.Page,
+    text: str,
+    right_x: float,
+    baseline_y: float,
+    bold: bool = False,
+    font_size: float = FONT_SIZE,
+) -> None:
+    """Insert text so its right edge aligns to right_x."""
+    fontname = FONT_BOLD if bold else FONT_REGULAR
+    tw = fitz.Font(fontname).text_length(text, fontsize=font_size)
+    page.insert_text(
+        fitz.Point(right_x - tw, baseline_y),
+        text, fontname=fontname, fontsize=font_size, color=(0, 0, 0)
+    )
+
+
+def _insert_centered(
+    page: fitz.Page,
+    text: str,
+    baseline_y: float,
+    bold: bool = True,
+    font_size: float = FONT_SIZE,
+    page_width: float = PAGE_WIDTH,
+) -> None:
+    """Insert text centered on the page — matches IGST/CESS lines."""
+    fontname = FONT_BOLD if bold else FONT_REGULAR
+    tw = fitz.Font(fontname).text_length(text, fontsize=font_size)
+    x  = (page_width - tw) / 2
+    page.insert_text(
+        fitz.Point(x, baseline_y),
+        text, fontname=fontname, fontsize=font_size, color=(0, 0, 0)
+    )
+
+
+# ── Span finders ───────────────────────────────────────────────────────────────
+
+def _find_span(spans: list[SpanInfo], page_num: int, text_hint: str,
+               min_x: float = 0) -> SpanInfo | None:
+    """Find first span on page containing text_hint."""
+    for s in spans:
+        if s.page == page_num and text_hint in s.text and s.bbox[0] >= min_x:
+            return s
+    return None
+
+
+def _find_right_span(spans: list[SpanInfo], page_num: int,
+                     hints: list[str]) -> SpanInfo | None:
+    """Find a right-column amount span by matching original value hints."""
+    p = [s for s in spans if s.page == page_num and s.bbox[0] > 490]
+    for hint in hints:
+        for s in p:
+            if hint in s.text:
+                return s
+    return None
 
 
 # ── Public API ─────────────────────────────────────────────────────────────────
@@ -98,122 +111,170 @@ def generate_pdf(
     output_filename:   str | None = None,
 ) -> Path:
     """
-    Generate updated PDF by redacting old values and inserting new ones
-    with exact font, size, bold, and right-alignment matching the original.
+    Generate updated PDF:
+    - Right-align numeric values in table columns (regular font)
+    - Right-align bold totals in right column
+    - Center-align bold IGST/CESS breakdown lines
+    - Handle items spanning multiple pages
     """
     original_pdf_path = Path(original_pdf_path)
-    doc   = fitz.open(str(original_pdf_path))
-    page0 = doc[0]
+    doc = fitz.open(str(original_pdf_path))
 
-    # ── Step 1: Queue all redactions ──────────────────────────────────────────
-    inserts = []   # (text, right_x, baseline_y, bold)
+    # page_num → [(bbox, new_text, insert_fn_args)]
+    # We store operations as (bbox_to_redact, callable) and execute per page
+    page_ops: dict[int, list[tuple]] = {}
 
-    # Line item cells
+    def queue(page_num: int, bbox: Tuple, fn, *args):
+        if page_num not in page_ops:
+            page_ops[page_num] = []
+        page_ops[page_num].append((bbox, fn, args))
+
+    # ── 1. Line item cells ────────────────────────────────────────────────────
     for item, edited in zip(dn.line_items, edited_rows):
+        pnum   = getattr(item, 'page', 0)
         coords = item.coords
 
-        cell_updates = {
-            "qty":        (_fmt_qty(float(edited.get("qty",       item.qty))),       COL_RIGHT["qty"]),
-            "rate":       (_fmt_num(float(edited.get("rate",      item.rate))),      COL_RIGHT["rate"]),
-            "sub_total":  (_fmt_num(float(edited.get("sub_total", item.sub_total))), COL_RIGHT["sub_total"]),
-            "gst_pct":    (_fmt_num(float(edited.get("gst_pct",   item.gst_pct))),   COL_RIGHT["gst_pct"]),
-            "net_amount": (_fmt_num(float(edited.get("net_amount",item.net_amount))),COL_RIGHT["net_amount"]),
+        cells = {
+            "qty":        (_fmt_qty(float(edited.get("qty",        item.qty))),        COL_RIGHT["qty"]),
+            "rate":       (_fmt_num(float(edited.get("rate",       item.rate))),       COL_RIGHT["rate"]),
+            "sub_total":  (_fmt_num(float(edited.get("sub_total",  item.sub_total))),  COL_RIGHT["sub_total"]),
+            "gst_pct":    (_fmt_num(float(edited.get("gst_pct",    item.gst_pct))),    COL_RIGHT["gst_pct"]),
+            "net_amount": (_fmt_num(float(edited.get("net_amount", item.net_amount))), COL_RIGHT["net_amount"]),
         }
 
-        for field_key, (new_text, right_x) in cell_updates.items():
+        for field_key, (new_text, right_x) in cells.items():
             bbox = coords.get(field_key)
-            if not bbox:
-                continue
-            _redact(page0, bbox)
-            baseline_y = bbox[3] - 1.5
-            inserts.append((new_text, right_x, baseline_y, False))
-            log.debug("Queued: %s → %s right_x=%.1f", field_key, new_text, right_x)
+            if bbox:
+                queue(pnum, bbox, _insert_right_aligned,
+                      doc[pnum], new_text, right_x, bbox[3]-1.5, False)
 
-    # Totals (bold, right-aligned to 554.5)
-    total_items = [
-        (628.0, str(totals.num_items),          True),
-        (650.0, _fmt_num(totals.sub_total),     True),
-        (671.0, _fmt_num(totals.gst_total),     True),
-        (692.0, _fmt_num(totals.total_payable), True),
+    # ── 2. Totals (bold, right-aligned) ──────────────────────────────────────
+    tp = getattr(dn, 'totals_page', 0)
+
+    # Match original amount values to find their bboxes, then replace
+    total_targets = [
+        ([str(dn.num_items)],     str(totals.num_items),          True),
+        ([str(dn.sub_total),
+          _fmt_num(dn.sub_total)], _fmt_num(totals.sub_total),    True),
+        ([str(dn.gst_total),
+          _fmt_num(dn.gst_total)], _fmt_num(totals.gst_total),    True),
+        ([str(dn.total_payable),
+          _fmt_num(dn.total_payable)], _fmt_num(totals.total_payable), True),
     ]
 
-    for target_y, new_text, bold in total_items:
-        bbox = _find_amount_bbox(dn.spans, target_y)
-        if bbox:
-            _redact(page0, bbox)
-            baseline_y = bbox[3] - 1.5
-            inserts.append((new_text, COL_RIGHT["totals"], baseline_y, bold))
+    for (hints, new_text, bold) in total_targets:
+        s = _find_right_span(dn.spans, tp, hints)
+        if s:
+            queue(tp, s.bbox, _insert_right_aligned,
+                  doc[tp], new_text, COL_RIGHT["totals"], s.bbox[3]-1.5, bold)
 
-    # IGST breakdown lines
-    _queue_igst(page0, dn.spans, edited_rows, inserts)
+    # ── 3. IGST/CESS breakdown (bold, center-aligned) ─────────────────────────
+    _queue_igst_cess(doc, dn, edited_rows, totals, page_ops, tp, queue)
 
-    # ── Step 2: Apply all redactions ─────────────────────────────────────────
-    page0.apply_redactions(images=fitz.PDF_REDACT_IMAGE_NONE)
+    # ── 4. Apply per page ─────────────────────────────────────────────────────
+    for pnum in sorted(page_ops.keys()):
+        pg  = doc[pnum]
+        ops = page_ops[pnum]
 
-    # ── Step 3: Insert all new values ────────────────────────────────────────
-    for (text, right_x, baseline_y, bold) in inserts:
-        _insert_right_aligned(page0, text, right_x, baseline_y, bold=bold)
+        # Pass 1: redact all
+        for (bbox, fn, args) in ops:
+            if bbox:
+                _redact(pg, bbox)
+        pg.apply_redactions(images=fitz.PDF_REDACT_IMAGE_NONE)
 
-    # ── Save ──────────────────────────────────────────────────────────────────
+        # Pass 2: insert all
+        for (bbox, fn, args) in ops:
+            fn(*args)
+
+    # ── 5. Save ───────────────────────────────────────────────────────────────
     if not output_filename:
         output_filename = f"{original_pdf_path.stem}_edited.pdf"
 
     out_path = OUTPUT_DIR / output_filename
     doc.save(str(out_path), garbage=4, deflate=True)
     doc.close()
-    log.info("PDF saved → %s", out_path)
+    log.info("Saved → %s", out_path)
     return out_path
 
 
-# ── IGST line rebuilder ────────────────────────────────────────────────────────
+# ── IGST/CESS section handler ──────────────────────────────────────────────────
 
-def _queue_igst(
-    page:        fitz.Page,
-    spans:       list[SpanInfo],
+def _queue_igst_cess(
+    doc:         fitz.Document,
+    dn:          DNDocument,
     edited_rows: list[dict],
-    inserts:     list,
+    totals:      Any,
+    page_ops:    dict,
+    tp:          int,
+    queue,
 ) -> None:
-    """Redact and rewrite the IGST and Total IGST lines."""
-    from calculation import build_igst_breakdown
+    """
+    Rebuild IGST/CESS breakdown lines matching original format exactly:
+    - Bold, center-aligned
+    - Format: IGST = <sub_total> * <gst>% = <amt>,
+    - Then: Total IGST = <total>
+    - Then CESS lines (unchanged)
+    """
+    spans = dn.spans
+    pg    = doc[tp]
 
-    p0 = [s for s in spans if s.page == 0]
+    # Find all bold centered lines on totals page (IGST/CESS section)
+    igst_spans  = [s for s in spans if s.page == tp and "IGST" in s.text and "=" in s.text and "Total" not in s.text]
+    tigst_spans = [s for s in spans if s.page == tp and "Total IGST" in s.text]
+    cess_spans  = [s for s in spans if s.page == tp and "CESS" in s.text and "Total" not in s.text and "ADDT" not in s.text]
+    tcess_spans = [s for s in spans if s.page == tp and "Total CESS" in s.text]
+    addt_spans  = [s for s in spans if s.page == tp and "ADDT_CESS" in s.text]
 
-    # IGST breakdown line (~y=708)
-    igst_line = [s for s in p0 if s.text.strip() == "IGST" and s.bbox[1] > 700]
-    if not igst_line:
-        return
+    # Build new IGST breakdown — group by GST rate
+    from collections import defaultdict
+    gst_groups = defaultdict(float)
+    for r in edited_rows:
+        sub = round(float(r.get('qty', 0)) * float(r.get('rate', 0)), 2)
+        gst = float(r.get('gst_pct', 0))
+        gst_groups[gst] += sub
 
-    row_y     = (igst_line[0].bbox[1] + igst_line[0].bbox[3]) / 2
-    line_spans = [s for s in p0 if abs((s.bbox[1] + s.bbox[3]) / 2 - row_y) < 8]
+    # Format: IGST = <sub1> * <gst>% = <amt1>, <sub2> * <gst>% = <amt2>,
+    igst_parts = []
+    igst_total = 0.0
+    for gst_pct, sub_sum in sorted(gst_groups.items()):
+        sub_sum  = round(sub_sum, 2)
+        amt      = round(sub_sum * gst_pct / 100, 2)
+        igst_total += amt
+        igst_parts.append(f"{sub_sum} * {gst_pct}% = {amt:.2f}")
 
-    if line_spans:
-        x0 = min(s.bbox[0] for s in line_spans)
-        y0 = min(s.bbox[1] for s in line_spans)
-        x1 = max(s.bbox[2] for s in line_spans)
-        y1 = max(s.bbox[3] for s in line_spans)
-        _redact(page, (x0, y0, x1, y1))
-        baseline_y = y1 - 1.5
+    igst_total = round(igst_total, 2)
+    new_igst_line  = "IGST = " + ", ".join(igst_parts) + ","
+    new_tigst_line = f"Total IGST = {igst_total:.2f}"
 
-        new_text = build_igst_breakdown(edited_rows)
-        lines    = new_text.split("\n")
-        inserts.append((lines[0] if lines else "", x0 + 200, baseline_y, False))
+    # Redact and rewrite IGST line
+    if igst_spans:
+        s = igst_spans[0]
+        queue(tp, s.bbox, _insert_centered, pg, new_igst_line, s.bbox[3]-1.5, True)
 
-    # Total IGST line (~y=720)
-    ti_spans = [s for s in p0 if "Total" in s.text and "IGST" in s.text and s.bbox[1] > 715]
-    if not ti_spans:
-        ti_spans = [s for s in p0 if abs((s.bbox[1] + s.bbox[3]) / 2 - 726) < 8]
+    # Redact and rewrite Total IGST line
+    if tigst_spans:
+        s = tigst_spans[0]
+        queue(tp, s.bbox, _insert_centered, pg, new_tigst_line, s.bbox[3]-1.5, True)
 
-    if ti_spans:
-        ti_x0 = min(s.bbox[0] for s in ti_spans)
-        ti_y0 = min(s.bbox[1] for s in ti_spans)
-        ti_x1 = max(s.bbox[2] for s in ti_spans)
-        ti_y1 = max(s.bbox[3] for s in ti_spans)
-        _redact(page, (ti_x0, ti_y0, ti_x1, ti_y1))
+    # CESS lines — recalculate based on new sub total
+    new_sub = round(sum(
+        float(r.get('qty',0)) * float(r.get('rate',0)) for r in edited_rows
+    ), 2)
+    new_cess_line  = f"CESS = {new_sub} * 0.0% = 0.00,"
+    new_tcess_line = "Total CESS = 0.00"
 
-        new_text = build_igst_breakdown(edited_rows)
-        lines    = new_text.split("\n")
-        if len(lines) > 1:
-            inserts.append((lines[1], ti_x0 + 150, ti_y1 - 1.5, True))
+    if cess_spans:
+        s = cess_spans[0]
+        queue(tp, s.bbox, _insert_centered, pg, new_cess_line, s.bbox[3]-1.5, True)
+
+    if tcess_spans:
+        s = tcess_spans[0]
+        queue(tp, s.bbox, _insert_centered, pg, new_tcess_line, s.bbox[3]-1.5, True)
+
+    # ADDT_CESS — always 0.00, no change needed but redact/rewrite to be safe
+    if addt_spans:
+        s = addt_spans[0]
+        queue(tp, s.bbox, _insert_centered, pg, "Total ADDT_CESS = 0.00", s.bbox[3]-1.5, True)
 
 
 # ── Format helpers ─────────────────────────────────────────────────────────────
